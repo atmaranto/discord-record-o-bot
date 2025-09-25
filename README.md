@@ -14,7 +14,7 @@ The following environmental variables are supported:
 RECORD_O_BOT_CODE=The Discord token for this bot
 RECORDINGS_DIR=./recordings # The directory to store recordings in (defaults to $PWD/recordings)
 BOT_OWNER=The Discord user ID of the bot owner
-WHO_CAN_USE=guild:the ID of a guild where everyone can use a bot,role:the ID of a role where everyone can use the bot,:user:The ID of a user who can use it
+WHO_CAN_USE=guild:the ID of a guild where everyone can use a bot,role:the ID of a role where everyone can use the bot,user:The ID of a user who can use it
 WHISPER_DEVICE=auto, cpu, or cuda # The device for Whisper to prefer
 WHISPER_MODEL=Systran/faster-distil-whisper-large-v2 # The model for Whisper to use
 RECORDING_EXTENSION=.mp3 # The extension to save recordings as
