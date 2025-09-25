@@ -38,4 +38,12 @@ jobs:
           atmaranto/record:${{ github.run_number }}
         file: record.Dockerfile
         context: .
+    - uses: docker/build-push-action@v6.18.0
+      with:
+        push: true
+        tags: |
+          atmaranto/record:no-transcription
+          atmaranto/record:${{ github.run_number }}-no-transcription
+        file: no-transcription.Dockerfile
+        context: .
     

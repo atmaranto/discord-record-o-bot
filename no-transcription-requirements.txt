@@ -1,0 +1,4 @@
+py-cord[voice] @ git+https://github.com/Pycord-Development/pycord@d5d162a
+
+numpy
+dotenv

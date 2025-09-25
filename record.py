@@ -6,8 +6,16 @@ import json
 
 import struct
 
-import scipy.signal
 import numpy as np
+try:
+    from faster_whisper import WhisperModel
+
+    import scipy.signal
+except ImportError:
+    TRANSCRIPTION_AVAILABLE = False
+    print("NOTE: Whisper transcription is not available. To enable it, install the faster-whisper, scipy, and numpy packages.")
+else:
+    TRANSCRIPTION_AVAILABLE = True
 
 import discord
 from discord.ext import commands
@@ -18,8 +26,6 @@ import threading
 import dotenv
 dotenv.load_dotenv()
 
-from faster_whisper import WhisperModel
-
 recording_extension = os.environ.get("RECORDING_EXTENSION", ".mp3")
 
 recordings_dir = os.environ.get("RECORDINGS_DIR", "./recordings")
@@ -29,10 +35,11 @@ if not os.path.exists(recordings_dir):
 if not os.path.exists(recordings_dir):
     os.makedirs(recordings_dir)
 
-device = os.environ.get("WHISPER_DEVICE", "auto")
+if TRANSCRIPTION_AVAILABLE:
+    device = os.environ.get("WHISPER_DEVICE", "auto")
 
-model_path = os.environ.get("WHISPER_MODEL", "Systran/faster-distil-whisper-large-v2")
-model = WhisperModel(model_path, device=device)
+    model_path = os.environ.get("WHISPER_MODEL", "Systran/faster-distil-whisper-large-v2")
+    model = WhisperModel(model_path, device=device)
 
 record_o_bot_code = os.environ.get("RECORD_O_BOT_CODE")
 if not record_o_bot_code:
@@ -122,7 +129,7 @@ class MuxingVoiceClient(VoiceClient):
 # Sink class from py-cord
 class MuxingSink(discord.sinks.Sink):
     """Combines multiple user streams into one by muxing them, filling in gaps with silence."""
-    def __init__(self, path):
+    def __init__(self, path, transcribe=TRANSCRIPTION_AVAILABLE):
         super().__init__()
         self.path = path
 
@@ -134,10 +141,11 @@ class MuxingSink(discord.sinks.Sink):
         self.last_ten_seconds = {}
         self.bytes_written = 0
 
-        self.transcript = {
-            "transcription": [],
-            "params": {"model": model_path, "language": "en"}
-        }
+        if TRANSCRIPTION_AVAILABLE and transcribe:
+            self.transcript = {
+                "transcription": [],
+                "params": {"model": model_path, "language": "en"}
+            }
         self.last_save_size = 0
         self.last_save_time = 0
 
@@ -155,10 +163,15 @@ class MuxingSink(discord.sinks.Sink):
         self.running = True
         self.queue = queue.Queue()
 
+        self.transcription_enabled = transcribe and TRANSCRIPTION_AVAILABLE
+
         self.thread = threading.Thread(target=self.transcribe, daemon=True)
         self.thread.start()
     
     def transcribe(self):
+        if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
+            return
+        
         while self.running:
             item = self.queue.get()
             if item is None:
@@ -234,6 +247,9 @@ class MuxingSink(discord.sinks.Sink):
             self.last_ten_seconds[user] = [0, [], 0, 0]
     
     def save_transcript(self):
+        if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
+            return
+        
         with open(self.path + ".json", "w") as f:
             json.dump(self.transcript, f)
             self.last_save_size = len(self.transcript["transcription"])
@@ -314,7 +330,7 @@ class MuxingSink(discord.sinks.Sink):
         self.p.communicate()
 
 @bot.slash_command(name="record", description="Records a message.")
-async def record(ctx: discord.Interaction, path: str):
+async def record(ctx: discord.Interaction, path: str, transcribe: bool = TRANSCRIPTION_AVAILABLE):
     global voice_channel, voice_client, save_path
     
     if getattr(ctx.user, "voice") is None or ctx.user.voice.channel is None:
@@ -329,6 +345,10 @@ async def record(ctx: discord.Interaction, path: str):
     path = "".join([c for c in path if (c.isalnum() and c.isascii()) or c in "._-"])[:50] + recording_extension
     if os.path.exists(os.path.join(recordings_dir, path)):
         await ctx.response.send_message("A file with that name already exists.")
+        return
+    
+    if transcribe and not TRANSCRIPTION_AVAILABLE:
+        await ctx.response.send_message("Transcription is not available on this bot.")
         return
 
     await ctx.response.send_message("Recording...")

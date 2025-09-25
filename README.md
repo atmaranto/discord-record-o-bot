@@ -43,14 +43,20 @@ Simply use `/record <filename>` in Discord to start recording to `<filename>.mp3
 This bot is fully compatible with Docker, and in fact, this is the preferred method for running Record-o-Bot. It is available at the following tags on Docker Hub:
 
 ```bash
-atmaranto/record:latest # The latest full image, including the predownloaded transcription model.
-atmaranto/record:lite   # The latest image without the transcription model. This will be downloaded automatically, but you can mount /root/.cache/huggingface to share your host's huggingface directory.
+atmaranto/record:latest           # The latest full image, including the predownloaded transcription model.
+
+atmaranto/record:lite             # The latest image without the transcription model. This will be downloaded
+                                  # automatically, but you can mount /root/.cache/huggingface to share your
+                                  # host's huggingface directory.
+
+atmaranto/record:no-transcription # The latest image with no transcription capabilities whatsoever. Transcription
+                                  # is disabled, and the model will not be downloaded on first run.
 ```
 
 To run Record-o-Bot with Docker, simply use the following command:
 
 ```bash
-docker run -it --gpus all --name record-bot -v /path/to/recordings:/recordings -v /path/to/dotenv/file:/.env atmaranto/record-o-bot:latest
+docker run -it --gpus all --name record-bot -v /path/to/recordings:/recordings -v /path/to/dotenv/file:/.env atmaranto/record:latest # or lite or no-transcription
 ```
 
 `record.py` is located at `/record.py` in the container, so you can replace it with a volume mount if you wish to run with a modified version of the script.
