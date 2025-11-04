@@ -1,4 +1,4 @@
-py-cord[voice] @ git+https://github.com/Pycord-Development/pycord@d5d162a
+py-cord[voice]==v2.7.0rc2
 
 numpy
 dotenv
