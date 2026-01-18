@@ -9,6 +9,7 @@ on:
       - 'record.Dockerfile'
       - 'record-lite.Dockerfile'
       - '.github/workflows/docker-image.yml'
+  workflow_dispatch:
 
 jobs:
   build:
