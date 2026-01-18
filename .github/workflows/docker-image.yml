@@ -13,6 +13,9 @@ on:
 
 jobs:
   build:
+    strategy:
+      matrix:
+        cuda: [ "13.1.0-runtime-ubuntu24.04", 12.9.1-cudnn-runtime-ubuntu24.04 ]
     environment:
       name: Docker
     runs-on: ubuntu-latest
@@ -29,6 +32,10 @@ jobs:
         tags: |
           atmaranto/record:lite
           atmaranto/record:${{ github.run_number }}-lite
+          atmaranto/record:lite-cuda${{ matrix.cuda }}
+          atmaranto/record:${{ github.run_number }}-lite-cuda${{ matrix.cuda }}
+        build-args: |
+          IMAGE_VERSION=${{ matrix.cuda }}
         file: record-lite.Dockerfile
         context: .
     - uses: docker/build-push-action@v6.18.0
@@ -37,6 +44,10 @@ jobs:
         tags: |
           atmaranto/record:latest
           atmaranto/record:${{ github.run_number }}
+          atmaranto/record:cuda${{ matrix.cuda }}
+          atmaranto/record:${{ github.run_number }}-cuda${{ matrix.cuda }}
+        build-args: |
+          IMAGE_VERSION=${{ matrix.cuda }}
         file: record.Dockerfile
         context: .
     - uses: docker/build-push-action@v6.18.0
@@ -45,6 +56,10 @@ jobs:
         tags: |
           atmaranto/record:no-transcription
           atmaranto/record:${{ github.run_number }}-no-transcription
+          atmaranto/record:no-transcription-cuda${{ matrix.cuda }}
+          atmaranto/record:${{ github.run_number }}-no-transcription-cuda${{ matrix.cuda }}
+        build-args: |
+          IMAGE_VERSION=${{ matrix.cuda }}
         file: no-transcription.Dockerfile
         context: .
     
