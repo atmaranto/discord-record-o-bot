@@ -15,7 +15,7 @@ jobs:
   build:
     strategy:
       matrix:
-        cuda: [ "13.1.0-runtime-ubuntu24.04", 12.9.1-cudnn-runtime-ubuntu24.04 ]
+        cuda: &cuda_versions [ "13.1.0-runtime-ubuntu24.04", "12.9.1-cudnn-runtime-ubuntu24.04" ]
     environment:
       name: Docker
     runs-on: ubuntu-latest
@@ -30,8 +30,6 @@ jobs:
       with:
         push: true
         tags: |
-          atmaranto/record:lite
-          atmaranto/record:${{ github.run_number }}-lite
           atmaranto/record:lite-cuda${{ matrix.cuda }}
           atmaranto/record:${{ github.run_number }}-lite-cuda${{ matrix.cuda }}
         build-args: |
@@ -42,24 +40,101 @@ jobs:
       with:
         push: true
         tags: |
-          atmaranto/record:latest
-          atmaranto/record:${{ github.run_number }}
-          atmaranto/record:cuda${{ matrix.cuda }}
-          atmaranto/record:${{ github.run_number }}-cuda${{ matrix.cuda }}
-        build-args: |
-          IMAGE_VERSION=${{ matrix.cuda }}
-        file: record.Dockerfile
-        context: .
-    - uses: docker/build-push-action@v6.18.0
-      with:
-        push: true
-        tags: |
-          atmaranto/record:no-transcription
-          atmaranto/record:${{ github.run_number }}-no-transcription
           atmaranto/record:no-transcription-cuda${{ matrix.cuda }}
           atmaranto/record:${{ github.run_number }}-no-transcription-cuda${{ matrix.cuda }}
         build-args: |
           IMAGE_VERSION=${{ matrix.cuda }}
         file: no-transcription.Dockerfile
         context: .
-    
+  
+  build-with-model:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: Docker
+    strategy:
+      matrix:
+        cuda: *cuda_versions
+        whisper_model:
+          - Systran/faster-whisper-tiny
+          - Systran/faster-whisper-tiny.en
+          - Systran/faster-whisper-small
+          - Systran/faster-whisper-small.en
+          - Systran/faster-whisper-base
+          - Systran/faster-whisper-base.en
+          - Systran/faster-whisper-medium
+          - Systran/faster-whisper-medium.en
+          - Systran/faster-whisper-large-v1
+          - Systran/faster-whisper-large-v2
+          # - Systran/faster-whisper-large-v3
+          - Systran/faster-distil-whisper-large-v3
+    steps:
+    - uses: actions/checkout@v4
+    - name: Set model short name
+      id: model_name
+      run: |
+        MODEL="${{ matrix.whisper_model }}"
+        SHORT_NAME="${MODEL#*whisper-}"
+        echo "short=$SHORT_NAME" >> $GITHUB_OUTPUT
+      shell: bash
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+    - uses: docker/build-push-action@v6.18.0
+      with:
+        push: true
+        tags: |
+          atmaranto/record:${{ steps.model_name.outputs.short }}-cuda${{ matrix.cuda }}
+          atmaranto/record:${{ github.run_number }}-cuda${{ matrix.cuda }}${{ steps.model_name.outputs.short }}
+        build-args: |
+          IMAGE_VERSION=${{ matrix.cuda }}
+          WHISPER_MODEL=${{ matrix.whisper_model }}
+        file: record.Dockerfile
+        context: .
+      
+  rename-latest-tags:
+    needs: [ build, build-with-model ]
+    runs-on: ubuntu-latest
+    environment:
+      name: Docker
+    strategy:
+      matrix:
+        cuda: *cuda_versions
+    steps:
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+    - name: Pull and retag latest images
+      run: |
+        docker pull atmaranto/record:large-cuda${{ matrix.cuda }} || true
+        docker tag atmaranto/record:large-cuda${{ matrix.cuda }} atmaranto/record:latest-cuda${{ matrix.cuda }}
+        docker push atmaranto/record:latest-cuda${{ matrix.cuda }}
+  
+  rename:
+    needs: [ build, build-with-model ]
+    runs-on: ubuntu-latest
+    environment:
+      name: Docker
+    steps:
+    - name: Login to DockerHub
+      uses: docker/login-action@v2
+      with:
+        username: ${{ secrets.DOCKER_HUB_USERNAME }}
+        password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
+    - name: Pull and retag latest no-transcription image
+      run: |
+        docker pull atmaranto/record:large-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
+        docker tag atmaranto/record:large-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:large:latest
+        docker push atmaranto/record:latest
+
+        docker pull atmaranto/record:no-transcription-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
+        docker tag atmaranto/record:no-transcription-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:no-transcription:latest
+        docker push atmaranto/record:no-transcription
+
+        docker pull atmaranto/record:lite-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
+        docker tag atmaranto/record:lite-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:lite:latest
+        docker push atmaranto/record:lite
