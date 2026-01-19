@@ -110,8 +110,8 @@ jobs:
         password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
     - name: Pull and retag latest images
       run: |
-        docker pull atmaranto/record:large-cuda${{ matrix.cuda }} || true
-        docker tag atmaranto/record:large-cuda${{ matrix.cuda }} atmaranto/record:latest-cuda${{ matrix.cuda }}
+        docker pull atmaranto/record:large-v3-cuda${{ matrix.cuda }} || true
+        docker tag atmaranto/record:large-v3-cuda${{ matrix.cuda }} atmaranto/record:latest-cuda${{ matrix.cuda }}
         docker push atmaranto/record:latest-cuda${{ matrix.cuda }}
   
   rename:
@@ -127,14 +127,14 @@ jobs:
         password: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}
     - name: Pull and retag latest no-transcription image
       run: |
-        docker pull atmaranto/record:large-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
-        docker tag atmaranto/record:large-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:large:latest
+        docker pull atmaranto/record:large-v3-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
+        docker tag atmaranto/record:large-v3-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:latest
         docker push atmaranto/record:latest
 
         docker pull atmaranto/record:no-transcription-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
-        docker tag atmaranto/record:no-transcription-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:no-transcription:latest
+        docker tag atmaranto/record:no-transcription-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:no-transcription
         docker push atmaranto/record:no-transcription
 
         docker pull atmaranto/record:lite-cuda12.9.1-cudnn-runtime-ubuntu24.04 || true
-        docker tag atmaranto/record:lite-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:lite:latest
+        docker tag atmaranto/record:lite-cuda12.9.1-cudnn-runtime-ubuntu24.04 atmaranto/record:lite
         docker push atmaranto/record:lite
