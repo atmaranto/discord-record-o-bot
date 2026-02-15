@@ -1,4 +1,4 @@
-py-cord[voice]==v2.7.0rc2
+py-cord[voice]==v2.7.1
 
 numpy
 faster-whisper
