@@ -15,7 +15,7 @@ jobs:
   build:
     strategy:
       matrix:
-        cuda: &cuda_versions [ "13.1.0-runtime-ubuntu24.04", "12.9.1-cudnn-runtime-ubuntu24.04" ]
+        cuda: &cuda_versions [ "13.2.0-runtime-ubuntu24.04", "12.9.1-cudnn-runtime-ubuntu24.04" ]
     environment:
       name: Docker
     runs-on: ubuntu-latest
