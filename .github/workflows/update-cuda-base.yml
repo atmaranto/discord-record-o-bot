@@ -1,0 +1,171 @@
+name: Update CUDA Base Image
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Run daily at 6 AM UTC
+  workflow_dispatch:
+
+jobs:
+  check-and-update:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Find latest nvidia/cuda tags
+        id: find_tags
+        run: |
+          python3 << 'PYEOF'
+          import urllib.request
+          import json
+          import re
+          import os
+
+          def fetch_json(url):
+              req = urllib.request.Request(
+                  url,
+                  headers={"Accept": "application/json"}
+              )
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.loads(resp.read())
+
+          runtime_pat = re.compile(r'^(\d+)\.(\d+)\.(\d+)-runtime-ubuntu24\.04$')
+          cudnn_pat   = re.compile(r'^(\d+)\.(\d+)\.(\d+)-cudnn-runtime-ubuntu24\.04$')
+
+          runtime_tags     = []
+          cudnn_tags       = []
+
+          # No ordering applied — we sort by semantic version ourselves with max()
+          url = "https://hub.docker.com/v2/repositories/nvidia/cuda/tags?page_size=100"
+          # Limit to a reasonable number of pages to avoid rate limits
+          max_pages = 20
+          page = 0
+          while url and page < max_pages:
+              data = fetch_json(url)
+              for tag_obj in data.get("results", []):
+                  name = tag_obj["name"]
+                  m = runtime_pat.match(name)
+                  if m:
+                      runtime_tags.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), name))
+                  m = cudnn_pat.match(name)
+                  if m:
+                      cudnn_tags.append((int(m.group(1)), int(m.group(2)), int(m.group(3)), name))
+              url = data.get("next")
+              page += 1
+
+          if not runtime_tags:
+              print("ERROR: No matching runtime tags found")
+              raise SystemExit(1)
+          if not cudnn_tags:
+              print("ERROR: No matching cudnn-runtime tags found")
+              raise SystemExit(1)
+
+          latest_runtime      = max(runtime_tags)[-1]
+          latest_cudnn_runtime = max(cudnn_tags)[-1]
+
+          print(f"Latest runtime tag:      {latest_runtime}")
+          print(f"Latest cudnn-runtime tag: {latest_cudnn_runtime}")
+
+          # Read current versions from docker-image.yml
+          with open(".github/workflows/docker-image.yml", "r") as f:
+              content = f.read()
+
+          match = re.search(r'cuda: &cuda_versions \[([^\]]+)\]', content)
+          if not match:
+              print("ERROR: Could not find cuda_versions in docker-image.yml")
+              raise SystemExit(1)
+
+          current_versions = [v.strip().strip('"') for v in match.group(1).split(',')]
+          print(f"Current versions: {current_versions}")
+
+          new_versions = [latest_runtime, latest_cudnn_runtime]
+
+          env_file = os.environ["GITHUB_OUTPUT"]  # Fails loudly if not set in CI
+          with open(env_file, "a") as f:
+              f.write(f"latest_runtime={latest_runtime}\n")
+              f.write(f"latest_cudnn_runtime={latest_cudnn_runtime}\n")
+              if set(new_versions) == set(current_versions):
+                  print("No updates needed — versions are already current.")
+                  f.write("needs_update=false\n")
+              else:
+                  print("New versions detected — will create/update PR.")
+                  f.write("needs_update=true\n")
+          PYEOF
+
+      - name: Apply version updates
+        if: steps.find_tags.outputs.needs_update == 'true'
+        env:
+          LATEST_RUNTIME: ${{ steps.find_tags.outputs.latest_runtime }}
+          LATEST_CUDNN_RUNTIME: ${{ steps.find_tags.outputs.latest_cudnn_runtime }}
+        run: |
+          python3 << 'PYEOF'
+          import re
+          import os
+
+          latest_runtime       = os.environ["LATEST_RUNTIME"]
+          latest_cudnn_runtime = os.environ["LATEST_CUDNN_RUNTIME"]
+
+          # ── docker-image.yml ────────────────────────────────────────────────
+          with open(".github/workflows/docker-image.yml", "r") as f:
+              content = f.read()
+
+          # Update the cuda_versions YAML anchor
+          content = re.sub(
+              r'cuda: &cuda_versions \[[^\]]+\]',
+              f'cuda: &cuda_versions [ "{latest_runtime}", "{latest_cudnn_runtime}" ]',
+              content,
+          )
+
+          # Update every hardcoded reference to old cudnn-runtime tags in the
+          # 'rename' and 'rename-latest-tags' jobs (e.g. image suffixes like
+          # -cuda12.9.1-cudnn-runtime-ubuntu24.04)
+          content = re.sub(
+              r'(-cuda)\d+\.\d+\.\d+-cudnn-runtime-ubuntu24\.04',
+              r'\g<1>' + latest_cudnn_runtime,
+              content,
+          )
+
+          with open(".github/workflows/docker-image.yml", "w") as f:
+              f.write(content)
+
+          # ── record-lite.Dockerfile ───────────────────────────────────────────
+          with open("record-lite.Dockerfile", "r") as f:
+              dockerfile = f.read()
+
+          dockerfile = re.sub(
+              r'ARG IMAGE_VERSION=[^\n]+',
+              f'ARG IMAGE_VERSION={latest_runtime}',
+              dockerfile,
+          )
+
+          with open("record-lite.Dockerfile", "w") as f:
+              f.write(dockerfile)
+
+          print(f"Updated runtime tag to:      {latest_runtime}")
+          print(f"Updated cudnn-runtime tag to: {latest_cudnn_runtime}")
+          PYEOF
+
+      - name: Create Pull Request
+        if: steps.find_tags.outputs.needs_update == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "chore: update nvidia/cuda base image to ${{ steps.find_tags.outputs.latest_runtime }} / ${{ steps.find_tags.outputs.latest_cudnn_runtime }}"
+          branch: update-cuda-base-image
+          delete-branch: true
+          title: "chore: update nvidia/cuda base image (${{ steps.find_tags.outputs.latest_runtime }})"
+          body: |
+            This PR was automatically created by the **CUDA base-image watcher** workflow.
+
+            New `nvidia/cuda` tags were detected on Docker Hub:
+
+            | Flavor | New tag |
+            |--------|---------|
+            | runtime | `${{ steps.find_tags.outputs.latest_runtime }}` |
+            | cudnn-runtime | `${{ steps.find_tags.outputs.latest_cudnn_runtime }}` |
+
+            **Files changed:**
+            - `.github/workflows/docker-image.yml` — `cuda_versions` matrix + hardcoded rename-job references
+            - `record-lite.Dockerfile` — default `IMAGE_VERSION` arg
