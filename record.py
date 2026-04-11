@@ -144,22 +144,19 @@ def _calculate_silence(user_timestamps, first_packet_timestamp, ssrc, receive_ti
         else:
             return dT - 960, first_packet_timestamp
 
-# Sink class from py-cord
-class MuxingSink(discord.sinks.Sink):
-    """Combines multiple user streams into one by muxing them, filling in gaps with silence."""
-    def __init__(self, path, transcribe=TRANSCRIPTION_AVAILABLE):
+class TranscribingSink(discord.sinks.Sink):
+    """Base class providing shared transcription state and worker thread for both sink types."""
+
+    def __init__(self, transcribe=TRANSCRIPTION_AVAILABLE):
         super().__init__()
-        self.path = path
-
-        self.user_buffers = {}
-        self.keep_last_packets = 4096 * 2 * 2
-        self.last_received = 0
-
-        # Keep the last ten seconds of audio together
+        self.first_packet_at = None
+        self._rtp_anchors = {}
+        self.silence_missing = 0
         self.last_ten_seconds = {}
-        self.bytes_written = 0
+        self.volume_threshold = 0.01
 
-        if TRANSCRIPTION_AVAILABLE and transcribe:
+        self.transcription_enabled = transcribe and TRANSCRIPTION_AVAILABLE
+        if self.transcription_enabled:
             self.transcript = {
                 "transcription": [],
                 "params": {"model": model_path, "language": "en"}
@@ -167,30 +164,16 @@ class MuxingSink(discord.sinks.Sink):
         self.last_save_size = 0
         self.last_save_time = 0
 
-        self.volume_threshold = 0.01
-
-        self.p = subprocess.Popen(
-            ["ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:", path],
-            stdin=subprocess.PIPE
-        )
-
-        self.silence_missing = 0
-
-        self.first_packet_at = None
-        self._rtp_anchors = {}
-
         self.running = True
         self.queue = queue.Queue()
 
-        self.transcription_enabled = transcribe and TRANSCRIPTION_AVAILABLE
-
-        self.thread = threading.Thread(target=self.transcribe, daemon=True)
+        self.thread = threading.Thread(target=self._transcribe_loop, daemon=True)
         self.thread.start()
-    
-    def transcribe(self):
+
+    def _transcribe_loop(self):
         if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
             return
-        
+
         while self.running:
             item = self.queue.get()
             if item is None:
@@ -200,7 +183,7 @@ class MuxingSink(discord.sinks.Sink):
             start -= self.silence_missing / 48000
             data = scipy.signal.resample(data, int(len(data) * 16000 / 48000))
             data = np.mean(data.reshape(-1, 2), axis=-1)
-            data = data / np.max(np.abs(data)) # Normalize
+            data = data / np.max(np.abs(data))
             result, result_info = model.transcribe(data, vad_filter=True, word_timestamps=True, beam_size=5, language="en")
 
             result = list(result)
@@ -222,7 +205,7 @@ class MuxingSink(discord.sinks.Sink):
                 s["to"] = "%02d:%02d:%02d,%03d" % ((seg.end + start) // 3600, ((seg.end + start) // 60) % 60, (seg.end + start) % 60, int(((seg.end + start) % 1) * 1000))
                 s["speakers"] = [user]
                 self.transcript["transcription"].append(s)
-            
+
             if len(self.transcript["transcription"]) - self.last_save_size > 100 or time.time() - self.last_save_time > 300:
                 self.save_transcript()
 
@@ -230,6 +213,28 @@ class MuxingSink(discord.sinks.Sink):
             result = result.strip()
 
             print(user + ":", result)
+
+    def save_transcript(self):
+        raise NotImplementedError
+
+
+# Sink class from py-cord
+class MuxingSink(TranscribingSink):
+    """Combines multiple user streams into one by muxing them, filling in gaps with silence."""
+    def __init__(self, path, transcribe=TRANSCRIPTION_AVAILABLE):
+        self.path = path
+
+        self.user_buffers = {}
+        self.keep_last_packets = 4096 * 2 * 2
+        self.last_received = 0
+        self.bytes_written = 0
+
+        self.p = subprocess.Popen(
+            ["ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:", path],
+            stdin=subprocess.PIPE
+        )
+
+        super().__init__(transcribe=transcribe)
     
     def write(self, data, user):
         receive_time = _rtp_to_time(self._rtp_anchors, data.packet.ssrc, data.packet.timestamp)
@@ -355,38 +360,18 @@ class MuxingSink(discord.sinks.Sink):
 
         self.vc.loop.create_task(_clean())
 
-class MultiStreamSink(discord.sinks.Sink):
+class MultiStreamSink(TranscribingSink):
     """Saves each user's audio to a separate file in a recording directory, with optional transcription."""
     def __init__(self, dir_path, individual_ext=individual_stream_extension, transcribe=TRANSCRIPTION_AVAILABLE):
-        super().__init__()
         self.dir_path = dir_path
         self.individual_ext = individual_ext
         os.makedirs(dir_path, exist_ok=True)
 
         self.user_processes = {}
-        self.first_packet_at = None
-        self._rtp_anchors = {}
-        self.silence_missing = 0
         self._user_timestamps = {}
         self._first_packet_timestamp = None
 
-        if TRANSCRIPTION_AVAILABLE and transcribe:
-            self.transcript = {
-                "transcription": [],
-                "params": {"model": model_path, "language": "en"}
-            }
-        self.last_save_size = 0
-        self.last_save_time = 0
-
-        self.volume_threshold = 0.01
-        self.last_ten_seconds = {}
-
-        self.running = True
-        self.queue = queue.Queue()
-        self.transcription_enabled = transcribe and TRANSCRIPTION_AVAILABLE
-
-        self.thread = threading.Thread(target=self._transcribe_thread, daemon=True)
-        self.thread.start()
+        super().__init__(transcribe=transcribe)
 
     def _get_user_process(self, user):
         if user not in self.user_processes:
@@ -396,50 +381,6 @@ class MultiStreamSink(discord.sinks.Sink):
                 stdin=subprocess.PIPE
             )
         return self.user_processes[user]
-
-    def _transcribe_thread(self):
-        if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
-            return
-
-        while self.running:
-            item = self.queue.get()
-            if item is None:
-                break
-
-            user, data, start = item
-            start -= self.silence_missing / 48000
-            data = scipy.signal.resample(data, int(len(data) * 16000 / 48000))
-            data = np.mean(data.reshape(-1, 2), axis=-1)
-            data = data / np.max(np.abs(data))
-            result, result_info = model.transcribe(data, vad_filter=True, word_timestamps=True, beam_size=5, language="en")
-
-            result = list(result)
-
-            for seg in result:
-                s = {"tokens": []}
-                s["start"] = seg.start + start
-                s["end"] = seg.end + start
-                s["text"] = seg.text
-                for word in seg.words:
-                    s["tokens"].append({
-                        "text": word.word,
-                        "timestamps": {
-                            "from": "%02d:%02d:%02d,%03d" % ((word.start + start) // 3600, ((word.start + start) // 60) % 60, (word.start + start) % 60, int(((word.start + start) % 1) * 1000)),
-                            "to": "%02d:%02d:%02d,%03d" % ((word.end + start) // 3600, ((word.end + start) // 60) % 60, (word.end + start) % 60, int(((word.end + start) % 1) * 1000))
-                        }, "speaker": user
-                    })
-                s["from"] = "%02d:%02d:%02d,%03d" % ((seg.start + start) // 3600, ((seg.start + start) // 60) % 60, (seg.start + start) % 60, int(((seg.start + start) % 1) * 1000))
-                s["to"] = "%02d:%02d:%02d,%03d" % ((seg.end + start) // 3600, ((seg.end + start) // 60) % 60, (seg.end + start) % 60, int(((seg.end + start) % 1) * 1000))
-                s["speakers"] = [user]
-                self.transcript["transcription"].append(s)
-
-            if len(self.transcript["transcription"]) - self.last_save_size > 100 or time.time() - self.last_save_time > 300:
-                self.save_transcript()
-
-            result = " ".join(item.text for item in result)
-            result = result.strip()
-
-            print(user + ":", result)
 
     def save_transcript(self):
         if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
