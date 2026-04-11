@@ -1,3 +1,4 @@
+import asyncio
 import queue
 import subprocess
 import os
@@ -5,6 +6,7 @@ import time
 import json
 
 import struct
+import traceback
 
 import numpy as np
 try:
@@ -19,21 +21,27 @@ else:
 
 import discord
 from discord.ext import commands
-from discord.voice_client import VoiceClient
+from discord.voice.client import VoiceClient
 
 import threading
 
 import dotenv
 dotenv.load_dotenv()
 
+# import logging
+# logging.basicConfig(level=logging.INFO)
+# logging.getLogger("discord.voice.receive.reader").setLevel(logging.DEBUG)
+
 recording_extension = os.environ.get("RECORDING_EXTENSION", ".mp3")
+individual_stream_extension = os.environ.get("INDIVIDUAL_STREAM_EXTENSION", "mp3")
 
 recordings_dir = os.environ.get("RECORDINGS_DIR", "./recordings")
-if not os.path.exists(recordings_dir):
-    raise ValueError("RECORDINGS_DIR does not exist: " + recordings_dir)
+if __name__ == "__main__":
+    if not os.path.exists(recordings_dir):
+        raise ValueError("RECORDINGS_DIR does not exist: " + recordings_dir)
 
-if not os.path.exists(recordings_dir):
-    os.makedirs(recordings_dir)
+    if not os.path.exists(recordings_dir):
+        os.makedirs(recordings_dir)
 
 if TRANSCRIPTION_AVAILABLE:
     device = os.environ.get("WHISPER_DEVICE", "auto")
@@ -42,32 +50,35 @@ if TRANSCRIPTION_AVAILABLE:
     model = WhisperModel(model_path, device=device)
 
 record_o_bot_code = os.environ.get("RECORD_O_BOT_CODE")
-if not record_o_bot_code:
+if not record_o_bot_code and __name__ == "__main__":
     raise ValueError("RECORD_O_BOT_CODE environment variable is not set.")
 
-intents = discord.Intents.default()
+intents = discord.Intents.all()
 intents.members = True
 
 bot = commands.Bot(command_prefix="!" , intents=intents)
-who_can_use = os.environ.get("WHO_CAN_USE", None)
+who_can_use = None
 
-if who_can_use is None:
-    bot_owner = os.environ.get("BOT_OWNER")
-    if not bot_owner:
-        raise ValueError("Either WHO_CAN_USE or BOT_OWNER environment variable must be set.")
-    
-    if not bot_owner.isdigit():
-        raise ValueError("BOT_OWNER environment variable is not a valid user ID.")
-    bot_owner = int(bot_owner)
-    who_can_use = [("user", bot_owner)]
-else:
-    who_can_use = [item.split(":") for item in who_can_use.split(",")]
-    for item in who_can_use:
-        if item[0] not in ("user", "role", "guild"):
-            raise ValueError("WHO_CAN_USE must be a comma-separated list of user:<id>, role:<id>, or guild:<id>.")
-        if not item[1].isdigit():
-            raise ValueError("WHO_CAN_USE must be a comma-separated list of user:<id>, role:<id>, or guild:<id>.")
-        item[1] = int(item[1])
+if __name__ == "__main__":
+    who_can_use = os.environ.get("WHO_CAN_USE", None)
+
+    if who_can_use is None:
+        bot_owner = os.environ.get("BOT_OWNER")
+        if not bot_owner:
+            raise ValueError("Either WHO_CAN_USE or BOT_OWNER environment variable must be set.")
+        
+        if not bot_owner.isdigit():
+            raise ValueError("BOT_OWNER environment variable is not a valid user ID.")
+        bot_owner = int(bot_owner)
+        who_can_use = [("user", bot_owner)]
+    else:
+        who_can_use = [item.split(":") for item in who_can_use.split(",")]
+        for item in who_can_use:
+            if item[0] not in ("user", "role", "guild"):
+                raise ValueError("WHO_CAN_USE must be a comma-separated list of user:<id>, role:<id>, or guild:<id>.")
+            if not item[1].isdigit():
+                raise ValueError("WHO_CAN_USE must be a comma-separated list of user:<id>, role:<id>, or guild:<id>.")
+            item[1] = int(item[1])
 
 @bot.check
 def check_permissions(ctx):
@@ -87,44 +98,51 @@ def check_permissions(ctx):
 voice_channel = None
 voice_client = None
 save_path = None
+_keepalive_task = None
 
-class MuxingVoiceClient(VoiceClient):
-    def _process_audio_packet(self, data):
-        if data.ssrc not in self.user_timestamps:  # First packet from user
-            if (
-                not self.user_timestamps or not self.sync_start
-            ):  # First packet from anyone
-                self.first_packet_timestamp = data.receive_time
-                silence = 0
+class CompatPacket:
+    """Wraps VoiceData to provide backward-compatible attributes for sink processing."""
+    __slots__ = ('decoded_data', 'receive_time')
+    def __init__(self, pcm, receive_time):
+        self.decoded_data = pcm
+        self.receive_time = receive_time
 
-            else:  # Previously received a packet from someone else
-                silence = (
-                    (data.receive_time - self.first_packet_timestamp) * 48000
-                ) - 960
 
-        else:  # Previously received a packet from user
-            dRT = (
-                data.receive_time - self.user_timestamps[data.ssrc][1]
-            ) * 48000  # delta receive time
-            dT = int(data.receive_time * 48000) - self.user_timestamps[data.ssrc][0]  # delta timestamp
+def _rtp_to_time(rtp_anchors, ssrc, rtp_timestamp):
+    """Convert an RTP timestamp to a normalized wall-clock time using per-SSRC anchoring.
+
+    On the first packet for each SSRC, the current wall-clock time is recorded
+    as an anchor. Subsequent packets derive their time from the RTP timestamp
+    delta, giving accurate relative timing even when packets arrive in batches.
+    """
+    if ssrc not in rtp_anchors:
+        wall = time.time()
+        rtp_anchors[ssrc] = (rtp_timestamp, wall)
+        return wall
+    anchor_rtp, anchor_wall = rtp_anchors[ssrc]
+    # Handle uint32 wrapping
+    delta = (rtp_timestamp - anchor_rtp) & 0xFFFFFFFF
+    return anchor_wall + delta / 48000.0
+
+
+def _calculate_silence(user_timestamps, first_packet_timestamp, ssrc, receive_time):
+    """Calculate silence (in samples) between the current packet and the previous one for a given SSRC."""
+    if ssrc not in user_timestamps:
+        if not user_timestamps or first_packet_timestamp is None:
+            return 0, receive_time  # first packet from anyone
+        else:
+            return ((receive_time - first_packet_timestamp) * 48000) - 960, first_packet_timestamp
+    else:
+        dRT = (receive_time - user_timestamps[ssrc][1]) * 48000
+        dT = int(receive_time * 48000) - user_timestamps[ssrc][0]
+        if dRT > 0:
             diff = abs(100 - dT * 100 / dRT)
-            if (
-                diff > 60 and dT != 960
-            ):  # If the difference in change is more than 60% threshold
-                silence = dRT - 960
-            else:
-                silence = dT - 960
-
-        self.user_timestamps.update({data.ssrc: (int(data.receive_time * 48000), data.receive_time)})
-
-        #data.decoded_data = (
-        #    struct.pack("<h", 0) * max(0, int(silence)) * opus._OpusStruct.CHANNELS
-        #    + data.decoded_data
-        #)
-
-        while data.ssrc not in self.ws.ssrc_map:
-            time.sleep(0.05)
-        self.sink.write(data, self.ws.ssrc_map[data.ssrc]["user_id"], silence)
+        else:
+            diff = 0
+        if diff > 60 and dT != 960:
+            return dRT - 960, first_packet_timestamp
+        else:
+            return dT - 960, first_packet_timestamp
 
 # Sink class from py-cord
 class MuxingSink(discord.sinks.Sink):
@@ -158,7 +176,8 @@ class MuxingSink(discord.sinks.Sink):
 
         self.silence_missing = 0
 
-        self.first_packet_at = time.time()
+        self.first_packet_at = None
+        self._rtp_anchors = {}
 
         self.running = True
         self.queue = queue.Queue()
@@ -181,7 +200,6 @@ class MuxingSink(discord.sinks.Sink):
             start -= self.silence_missing / 48000
             data = scipy.signal.resample(data, int(len(data) * 16000 / 48000))
             data = np.mean(data.reshape(-1, 2), axis=-1)
-            print(np.max(np.abs(data)))
             data = data / np.max(np.abs(data)) # Normalize
             result, result_info = model.transcribe(data, vad_filter=True, word_timestamps=True, beam_size=5, language="en")
 
@@ -213,38 +231,47 @@ class MuxingSink(discord.sinks.Sink):
 
             print(user + ":", result)
     
-    def write(self, data, user, silence):
-        if user not in self.user_buffers:
-            self.user_buffers[user] = [0, []]
+    def write(self, data, user):
+        receive_time = _rtp_to_time(self._rtp_anchors, data.packet.ssrc, data.packet.timestamp)
+        if self.first_packet_at is None:
+            self.first_packet_at = receive_time
+        user_id = user.id if user is not None else data.packet.ssrc
+        packet = CompatPacket(data.pcm, receive_time)
+        # print("Writing packet from", user_id, "with", len(packet.decoded_data), "bytes")
+        if user_id not in self.user_buffers:
+            self.user_buffers[user_id] = [0, []]
 
-        if self.user_buffers[user][0] + len(data.decoded_data) > self.keep_last_packets or self.last_received - int(data.receive_time * 48000) > 0.02:
+        if self.user_buffers[user_id][0] + len(packet.decoded_data) > self.keep_last_packets or self.last_received - int(packet.receive_time * 48000) > 0.02:
             # Flush the buffer
             self.flush_buffers()
         
         # Write the audio to the buffer
-        self.user_buffers[user][1].append(data)
-        self.user_buffers[user][0] += len(data.decoded_data) // 2
+        self.user_buffers[user_id][1].append(packet)
+        self.user_buffers[user_id][0] += len(packet.decoded_data) // 2
 
-        # Keep the last ten seconds of audio
-        if user not in self.last_ten_seconds:
-            self.last_ten_seconds[user] = [0, [], data.receive_time, None]
+        # Keep the last ten seconds of audio (for transcription)
+        if not self.transcription_enabled:
+            return
+
+        if user_id not in self.last_ten_seconds:
+            self.last_ten_seconds[user_id] = [0, [], receive_time, None]
         
-        last_received = self.last_ten_seconds[user][2] or data.receive_time
-        time_diff = (data.receive_time - last_received)
+        last_received = self.last_ten_seconds[user_id][2] or receive_time
+        time_diff = (receive_time - last_received)
         
-        arr = np.frombuffer(data.decoded_data, dtype=np.int16).astype(np.float32) / 32768.0
-        self.last_ten_seconds[user][1].append(arr)
-        self.last_ten_seconds[user][0] += len(data.decoded_data) // 2
+        arr = np.frombuffer(packet.decoded_data, dtype=np.int16).astype(np.float32) / 32768.0
+        self.last_ten_seconds[user_id][1].append(arr)
+        self.last_ten_seconds[user_id][0] += len(packet.decoded_data) // 2
         
         if np.max(np.abs(arr)) > self.volume_threshold:
-            self.last_ten_seconds[user][2] = data.receive_time
+            self.last_ten_seconds[user_id][2] = receive_time
         
-        current_time = time.time()
-        self.last_ten_seconds[user][3] = self.last_ten_seconds[user][3] or current_time
+        self.last_ten_seconds[user_id][3] = self.last_ten_seconds[user_id][3] or receive_time
         
-        if (self.last_ten_seconds[user][0] > 10 * 2 * 48000 or time_diff > 0.2) and len(self.last_ten_seconds[user][1]) > 0:
-            self.queue.put((getattr(bot.get_user(user), 'display_name', str(user)), np.concatenate(self.last_ten_seconds[user][1]), self.last_ten_seconds[user][3] - self.first_packet_at))
-            self.last_ten_seconds[user] = [0, [], 0, 0]
+        if (self.last_ten_seconds[user_id][0] > 10 * 2 * 48000 or time_diff > 0.2) and len(self.last_ten_seconds[user_id][1]) > 0:
+            display_name = getattr(user, 'display_name', str(user_id))
+            self.queue.put((display_name, np.concatenate(self.last_ten_seconds[user_id][1]), self.last_ten_seconds[user_id][3] - self.first_packet_at))
+            self.last_ten_seconds[user_id] = [0, [], 0, 0]
     
     def save_transcript(self):
         if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
@@ -314,23 +341,330 @@ class MuxingSink(discord.sinks.Sink):
         self.bytes_written += len(data)
     
     def cleanup(self):
-        print("Cleaning up (fake)")
-    
-    def real_cleanup(self):
-        super().cleanup()
-        print("Cleaning up (real)")
         self.flush_buffers()
 
         self.running = False
         self.queue.put(None)
-        self.thread.join()
 
-        self.save_transcript()
+        async def _clean():
+            await self.vc.loop.run_in_executor(None, self.thread.join)
 
-        self.p.communicate()
+            self.save_transcript()
+
+            await self.vc.loop.run_in_executor(None, self.p.communicate)
+
+        self.vc.loop.create_task(_clean())
+
+class MultiStreamSink(discord.sinks.Sink):
+    """Saves each user's audio to a separate file in a recording directory, with optional transcription."""
+    def __init__(self, dir_path, individual_ext=individual_stream_extension, transcribe=TRANSCRIPTION_AVAILABLE):
+        super().__init__()
+        self.dir_path = dir_path
+        self.individual_ext = individual_ext
+        os.makedirs(dir_path, exist_ok=True)
+
+        self.user_processes = {}
+        self.first_packet_at = None
+        self._rtp_anchors = {}
+        self.silence_missing = 0
+        self._user_timestamps = {}
+        self._first_packet_timestamp = None
+
+        if TRANSCRIPTION_AVAILABLE and transcribe:
+            self.transcript = {
+                "transcription": [],
+                "params": {"model": model_path, "language": "en"}
+            }
+        self.last_save_size = 0
+        self.last_save_time = 0
+
+        self.volume_threshold = 0.01
+        self.last_ten_seconds = {}
+
+        self.running = True
+        self.queue = queue.Queue()
+        self.transcription_enabled = transcribe and TRANSCRIPTION_AVAILABLE
+
+        self.thread = threading.Thread(target=self._transcribe_thread, daemon=True)
+        self.thread.start()
+
+    def _get_user_process(self, user):
+        if user not in self.user_processes:
+            path = os.path.join(self.dir_path, str(user) + "." + self.individual_ext)
+            self.user_processes[user] = subprocess.Popen(
+                ["ffmpeg", "-y", "-f", "s16le", "-ar", "48000", "-ac", "2", "-i", "pipe:", path],
+                stdin=subprocess.PIPE
+            )
+        return self.user_processes[user]
+
+    def _transcribe_thread(self):
+        if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
+            return
+
+        while self.running:
+            item = self.queue.get()
+            if item is None:
+                break
+
+            user, data, start = item
+            start -= self.silence_missing / 48000
+            data = scipy.signal.resample(data, int(len(data) * 16000 / 48000))
+            data = np.mean(data.reshape(-1, 2), axis=-1)
+            data = data / np.max(np.abs(data))
+            result, result_info = model.transcribe(data, vad_filter=True, word_timestamps=True, beam_size=5, language="en")
+
+            result = list(result)
+
+            for seg in result:
+                s = {"tokens": []}
+                s["start"] = seg.start + start
+                s["end"] = seg.end + start
+                s["text"] = seg.text
+                for word in seg.words:
+                    s["tokens"].append({
+                        "text": word.word,
+                        "timestamps": {
+                            "from": "%02d:%02d:%02d,%03d" % ((word.start + start) // 3600, ((word.start + start) // 60) % 60, (word.start + start) % 60, int(((word.start + start) % 1) * 1000)),
+                            "to": "%02d:%02d:%02d,%03d" % ((word.end + start) // 3600, ((word.end + start) // 60) % 60, (word.end + start) % 60, int(((word.end + start) % 1) * 1000))
+                        }, "speaker": user
+                    })
+                s["from"] = "%02d:%02d:%02d,%03d" % ((seg.start + start) // 3600, ((seg.start + start) // 60) % 60, (seg.start + start) % 60, int(((seg.start + start) % 1) * 1000))
+                s["to"] = "%02d:%02d:%02d,%03d" % ((seg.end + start) // 3600, ((seg.end + start) // 60) % 60, (seg.end + start) % 60, int(((seg.end + start) % 1) * 1000))
+                s["speakers"] = [user]
+                self.transcript["transcription"].append(s)
+
+            if len(self.transcript["transcription"]) - self.last_save_size > 100 or time.time() - self.last_save_time > 300:
+                self.save_transcript()
+
+            result = " ".join(item.text for item in result)
+            result = result.strip()
+
+            print(user + ":", result)
+
+    def save_transcript(self):
+        if not TRANSCRIPTION_AVAILABLE or not self.transcription_enabled:
+            return
+
+        with open(os.path.join(self.dir_path, "transcript.json"), "w") as f:
+            json.dump(self.transcript, f)
+            self.last_save_size = len(self.transcript["transcription"])
+            self.last_save_time = time.time()
+
+    def write_silence_for_user(self, user, silence_samples):
+        p = self._get_user_process(user)
+        while silence_samples > 0:
+            chunk = min(silence_samples, 4800)
+            p.stdin.write(struct.pack("<h", 0) * chunk * 2)
+            silence_samples -= chunk
+
+    def write(self, data, user):
+        receive_time = _rtp_to_time(self._rtp_anchors, data.packet.ssrc, data.packet.timestamp)
+        if self.first_packet_at is None:
+            self.first_packet_at = receive_time
+        user_id = user.id if user is not None else data.packet.ssrc
+        ssrc = data.packet.ssrc
+
+        # Calculate silence from timing
+        silence, self._first_packet_timestamp = _calculate_silence(
+            self._user_timestamps, self._first_packet_timestamp, ssrc, receive_time
+        )
+        self._user_timestamps[ssrc] = (int(receive_time * 48000), receive_time)
+
+        p = self._get_user_process(user_id)
+
+        # Write silence for this user's individual stream
+        silence_samples = int(max(0, silence))
+        if silence_samples > 0:
+            capped = min(silence_samples, 10 * 48000)
+            self.write_silence_for_user(user_id, capped)
+            if silence_samples > capped:
+                self.silence_missing += silence_samples - capped
+
+        # Write audio data to this user's ffmpeg process
+        p.stdin.write(data.pcm)
+
+        # Transcription handling
+        if not self.transcription_enabled:
+            return
+
+        if user_id not in self.last_ten_seconds:
+            self.last_ten_seconds[user_id] = [0, [], receive_time, None]
+
+        last_received = self.last_ten_seconds[user_id][2] or receive_time
+        time_diff = (receive_time - last_received)
+
+        arr = np.frombuffer(data.pcm, dtype=np.int16).astype(np.float32) / 32768.0
+        self.last_ten_seconds[user_id][1].append(arr)
+        self.last_ten_seconds[user_id][0] += len(data.pcm) // 2
+
+        if np.max(np.abs(arr)) > self.volume_threshold:
+            self.last_ten_seconds[user_id][2] = receive_time
+
+        self.last_ten_seconds[user_id][3] = self.last_ten_seconds[user_id][3] or receive_time
+
+        if (self.last_ten_seconds[user_id][0] > 10 * 2 * 48000 or time_diff > 0.2) and len(self.last_ten_seconds[user_id][1]) > 0:
+            display_name = getattr(user, 'display_name', str(user_id))
+            self.queue.put((display_name, np.concatenate(self.last_ten_seconds[user_id][1]), self.last_ten_seconds[user_id][3] - self.first_packet_at))
+            self.last_ten_seconds[user_id] = [0, [], 0, 0]
+
+    def cleanup(self):
+        super().cleanup()
+        self.running = False
+        self.queue.put(None)
+
+        async def _clean():
+            await self.vc.loop.run_in_executor(None, self.thread.join)
+
+            self.save_transcript()
+
+            for p in self.user_processes.values():
+                p.stdin.close()
+                await self.vc.loop.run_in_executor(None, p.wait)
+
+            self._generate_consolidate_scripts()
+        
+        self.vc.loop.create_task(_clean())
+
+    def _generate_consolidate_scripts(self):
+        ext = self.individual_ext
+
+        # --- Consolidate.py ---
+        py_content = '''#!/usr/bin/env python3
+"""Consolidate individual audio streams into a single file.
+
+Reads the transcription transcript.json to identify speakers and timing,
+then uses ffmpeg to combine all individual streams.
+
+Usage:
+    python Consolidate.py [output_file] [--mix]
+
+Options:
+    output_file  Output filename (default: consolidated.EXT)
+    --mix        Mix all streams into a single audio track.
+                 Without --mix, each user is kept as a separate audio
+                 track in a multi-stream container (e.g. .mkv).
+"""
+import json
+import os
+import subprocess
+import sys
+
+AUDIO_EXT = "__AUDIO_EXT__"
+
+
+def find_transcript():
+    """Load transcript.json if it exists."""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcript.json")
+    if os.path.isfile(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
+def find_audio_files(exclude=None):
+    """Find all individual stream audio files in this directory."""
+    exclude = set(exclude or [])
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    files = []
+    for f in sorted(os.listdir(script_dir)):
+        full = os.path.join(script_dir, f)
+        if os.path.isfile(full) and f.endswith("." + AUDIO_EXT):
+            if f not in exclude and not f.startswith("consolidated"):
+                files.append(f)
+    return files
+
+
+def show_transcript_info(transcript):
+    """Display speaker info from the transcript."""
+    if not transcript or "transcription" not in transcript:
+        return
+    speakers = {}
+    for seg in transcript["transcription"]:
+        for speaker in seg.get("speakers", []):
+            if speaker not in speakers:
+                speakers[speaker] = {"segments": 0, "duration": 0.0}
+            speakers[speaker]["segments"] += 1
+            speakers[speaker]["duration"] += seg.get("end", 0) - seg.get("start", 0)
+    print(f"Transcript: {len(speakers)} speaker(s)")
+    for speaker, info in speakers.items():
+        segs = info["segments"]
+        dur = info["duration"]
+        print(f"  {speaker}: {segs} segment(s), {dur:.1f}s speaking time")
+
+
+def main():
+    mix_mode = "--mix" in sys.argv
+    args = [a for a in sys.argv[1:] if a != "--mix"]
+
+    if mix_mode:
+        default_output = f"consolidated.{AUDIO_EXT}"
+    else:
+        default_output = "consolidated.mkv"
+    output = args[0] if args else default_output
+
+    audio_files = find_audio_files(exclude={output})
+    if not audio_files:
+        print("No audio files found to consolidate.")
+        sys.exit(1)
+
+    transcript = find_transcript()
+
+    n = len(audio_files)
+    print(f"Found {n} audio stream(s):")
+    for f in audio_files:
+        print(f"  - {f}")
+
+    if transcript:
+        show_transcript_info(transcript)
+
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    cmd = ["ffmpeg"]
+    for f in audio_files:
+        cmd.extend(["-i", os.path.join(script_dir, f)])
+
+    if mix_mode:
+        cmd.extend([
+            "-filter_complex",
+            f"amix=inputs={n}:duration=longest:dropout_transition=0",
+        ])
+    else:
+        for i in range(n):
+            cmd.extend(["-map", f"{i}:a"])
+
+    cmd.extend(["-y", os.path.join(script_dir, output)])
+
+    print(f"\\nConsolidating {n} stream(s) into {output}...")
+    result = subprocess.run(cmd)
+    if result.returncode == 0:
+        print(f"Successfully created {output}")
+    else:
+        print(f"Error: ffmpeg exited with code {result.returncode}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
+'''.replace("__AUDIO_EXT__", ext)
+
+        # --- Consolidate.bat ---
+        bat_content = '@echo off\n'
+        bat_content += 'REM Consolidate individual audio streams into a single file\n'
+        bat_content += 'REM Usage: Consolidate.bat [output_file] [--mix]\n'
+        bat_content += 'python "%~dp0Consolidate.py" %*\n'
+
+        # --- Consolidate.sh ---
+        sh_content = '#!/bin/bash\n'
+        sh_content += '# Consolidate individual audio streams into a single file\n'
+        sh_content += '# Usage: ./Consolidate.sh [output_file] [--mix]\n'
+        sh_content += 'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+        sh_content += 'python3 "$SCRIPT_DIR/Consolidate.py" "$@"\n'
+
+        for filename, content in [("Consolidate.py", py_content), ("Consolidate.bat", bat_content), ("Consolidate.sh", sh_content)]:
+            with open(os.path.join(self.dir_path, filename), "w", newline=('\r\n' if filename.endswith('.bat') else '\n')) as f:
+                f.write(content)
 
 @bot.slash_command(name="record", description="Records a message.")
-async def record(ctx: discord.Interaction, path: str, transcribe: bool = TRANSCRIPTION_AVAILABLE):
+async def record(ctx: discord.Interaction, path: str, transcribe: bool = TRANSCRIPTION_AVAILABLE, mode: str = "muxed", individual_format: str = individual_stream_extension):
     global voice_channel, voice_client, save_path
     
     if getattr(ctx.user, "voice") is None or ctx.user.voice.channel is None:
@@ -341,42 +675,59 @@ async def record(ctx: discord.Interaction, path: str, transcribe: bool = TRANSCR
         await ctx.response.send_message("The bot is already recording. Please stop the current recording in \"" + voice_channel.name + "\" before starting a new one.")
         return
 
+    if mode not in ("muxed", "multi"):
+        await ctx.response.send_message("Mode must be 'muxed' or 'multi'.")
+        return
+
     # Strip all non-alphanumeric characters from the path
-    path = "".join([c for c in path if (c.isalnum() and c.isascii()) or c in "._-"])[:50] + recording_extension
+    sanitized = "".join([c for c in path if (c.isalnum() and c.isascii()) or c in "._-"])[:50]
+    if mode == "multi":
+        path = sanitized + "_recording"
+    else:
+        path = sanitized + recording_extension
     if os.path.exists(os.path.join(recordings_dir, path)):
-        await ctx.response.send_message("A file with that name already exists.")
+        await ctx.response.send_message("A file or directory with that name already exists.")
         return
     
     if transcribe and not TRANSCRIPTION_AVAILABLE:
         await ctx.response.send_message("Transcription is not available on this bot.")
         return
 
-    await ctx.response.send_message("Recording...")
+    message = await ctx.response.send_message("Connecting to voice...")
 
-    voice_client = await ctx.user.voice.channel.connect(cls=MuxingVoiceClient)
+    voice_client = await ctx.user.voice.channel.connect()
     print("Created")
     voice_channel = ctx.user.voice.channel
     save_path = os.path.join(recordings_dir, path)
-    sink = MuxingSink(save_path)
+    if mode == "multi":
+        sink = MultiStreamSink(save_path, individual_ext=individual_format, transcribe=transcribe)
+    else:
+        sink = MuxingSink(save_path, transcribe=transcribe)
 
-    async def on_stop(s):
+    def on_stop(s):
         global voice_channel, voice_client, save_path
-        if voice_channel is not None:
-            print("WARNING! Possible attempt to stop recording early?")
-
-            voice_client = await voice_channel.connect(cls=MuxingVoiceClient)
-            voice_client.start_recording(sink, on_stop, sync_start=False)
-            return
-
-        sink.real_cleanup()
 
         voice_channel = None
         voice_client = None
         save_path = None
 
-    voice_client.start_recording(sink, on_stop, sync_start=False)
+    voice_client.start_recording(sink, on_stop)
 
-    await ctx.response.edit_message(content="Recording to " + path + ".")
+    # Keep the event loop responsive during recording.
+    # Pycord's SocketReader dispatches packet-processing tasks via
+    # loop.call_soon() from a background thread, which does NOT wake
+    # the Windows ProactorEventLoop from its IOCP poll.  Without a
+    # periodic timer, packets silently accumulate in the ready queue
+    # and the jitter buffer overflows when they are finally processed
+    # in a single burst.
+    async def _event_loop_keepalive():
+        while voice_client is not None:
+            await asyncio.sleep(0.02)
+
+    global _keepalive_task
+    _keepalive_task = bot.loop.create_task(_event_loop_keepalive())
+
+    await message.edit(content="Recording to " + path + ".")
 
 @bot.slash_command(name="stop", description="Stops recording.")
 async def stop(ctx: discord.Interaction):
@@ -386,6 +737,11 @@ async def stop(ctx: discord.Interaction):
         return
 
     await ctx.response.send_message("Stopping...")
+
+    global _keepalive_task
+    if _keepalive_task is not None:
+        _keepalive_task.cancel()
+        _keepalive_task = None
 
     voice_channel = None
     voice_client.stop_recording()
@@ -403,4 +759,5 @@ async def ping(ctx: discord.Interaction):
 async def on_ready():
     print("Ready")
 
-bot.run(record_o_bot_code)
+if __name__ == "__main__":
+    bot.run(record_o_bot_code)
