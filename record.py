@@ -290,8 +290,8 @@ class MuxingSink(TranscribingSink):
     def write_silence(self, silence):
         # Write silence in 100ms chunks
         
-        if silence > 0:
-            print("Wrote", silence, "samples of silence (" + str(silence / 48000) + "s)")
+        # if silence > 0:
+        #     print("Wrote", silence, "samples of silence (" + str(silence / 48000) + "s)")
         silence = int(silence)
         while silence > 0:
             chunk = min(silence, 4800)

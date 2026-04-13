@@ -1,4 +1,4 @@
-ARG IMAGE_VERSION=13.2.0-runtime-ubuntu24.04
+ARG IMAGE_VERSION=12.9.1-cudnn-runtime-ubuntu24.04
 FROM nvidia/cuda:${IMAGE_VERSION}
 
 ENV DEBIAN_FRONTEND=noninteractive
